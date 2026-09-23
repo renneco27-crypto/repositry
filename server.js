@@ -2,7 +2,7 @@ const http = require('http');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 10000;
-const OPEN_MIC_DEBOUNCE_MS = 1500;
+const OPEN_MIC_DEBOUNCE_MS = 4000;
 
 const state = {
   startedAt: Date.now(),
