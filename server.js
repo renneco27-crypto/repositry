@@ -1,29 +1,22 @@
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 10000;
-
-// ---- config ----
-const SPEECH_THRESHOLD     = 0.5;
-const MIN_SPEECH_MS        = 200;
 const OPEN_MIC_DEBOUNCE_MS = 1500;
 
-// ---- state for UI ----
 const state = {
   startedAt: Date.now(),
-  extension: { connected: false, since: null, deviceLabel: null, lastAudioAt: null, audioCount: 0 },
-  wrappers: new Map(), // ws -> { since, ip }
-  events: [],          // ring of last 100 events
+  extension: { connected: false, since: null, deviceLabel: null, lastAudioAt: null, audioCount: 0, speechCount: 0 },
+  wrappers: new Map(),
+  events: [],
 };
 
 function pushEvent(type, detail) {
-  state.events.push({ ts: Date.now(), type, detail });
-  if (state.events.length > 100) state.events.shift();
+  state.events.push({ ts: Date.now(), type, detail: detail || null });
+  if (state.events.length > 500) state.events.shift();
+  console.log('[evt]', type, detail ? JSON.stringify(detail) : '');
 }
 
-// ---- HTTP server (serves the UI) ----
 const server = http.createServer((req, res) => {
   if (req.url === '/' || req.url === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -37,14 +30,20 @@ const server = http.createServer((req, res) => {
       extension: state.extension,
       wrapperCount: state.wrappers.size,
       wrappers: [...state.wrappers.values()],
-      events: state.events.slice(-40).reverse()
+      events: state.events.slice(-200).reverse()
     }));
+    return;
+  }
+  if (req.url === '/clear' && req.method === 'POST') {
+    state.events.length = 0;
+    pushEvent('log_cleared', {});
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
     return;
   }
   res.writeHead(404); res.end('not found');
 });
 
-// ---- WebSocket server on the same HTTP server ----
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
@@ -57,14 +56,12 @@ wss.on('connection', (ws, req) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    // role registration
     if (msg.role) {
       ws.role = msg.role;
       if (msg.role === 'extension') {
         state.extension.connected = true;
         state.extension.since = Date.now();
-        state.extension.deviceLabel = msg.deviceLabel || null;
-        pushEvent('extension_connected', { deviceLabel: msg.deviceLabel });
+        pushEvent('extension_connected', { ip });
       } else if (msg.role === 'wrapper') {
         state.wrappers.set(ws, { since: Date.now(), ip });
         pushEvent('wrapper_connected', { ip });
@@ -72,11 +69,13 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // audio from extension
+    if (ws.role === 'extension' && msg.type === 'ping') return;
+
     if (ws.role === 'extension' && msg.type === 'audio') {
       state.extension.lastAudioAt = Date.now();
       state.extension.audioCount++;
       if (!msg.speech) return;
+      state.extension.speechCount++;
 
       const now = Date.now();
       if (now - ws.lastOpenMicAt < OPEN_MIC_DEBOUNCE_MS) return;
@@ -97,7 +96,7 @@ wss.on('connection', (ws, req) => {
     if (ws.role === 'extension') {
       state.extension.connected = false;
       state.extension.since = null;
-      pushEvent('extension_disconnected', {});
+      pushEvent('extension_disconnected', { ip });
     } else if (ws.role === 'wrapper') {
       state.wrappers.delete(ws);
       pushEvent('wrapper_disconnected', { ip });
@@ -110,7 +109,6 @@ wss.on('connection', (ws, req) => {
 
 server.listen(PORT, () => console.log('[vad-bridge] http+ws on', PORT));
 
-// ---- the UI ----
 const INDEX_HTML = `<!doctype html>
 <html>
 <head>
@@ -128,13 +126,26 @@ const INDEX_HTML = `<!doctype html>
   .big { font-size:22px; font-weight:600; }
   .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; background:#f85149; }
   .dot.on { background:#3fb950; box-shadow:0 0 8px #3fb95088; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #21262d; }
-  th { color:#8b949e; font-weight:500; }
-  .evt { font-size:12px; }
-  .evt .t { color:#8b949e; }
-  .evt .k { color:#79c0ff; }
-  .evt .d { color:#a5d6ff; }
+  .toolbar { display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap; }
+  .toolbar button, .toolbar select {
+    background:#21262d; color:#e6edf3; border:1px solid #30363d; border-radius:6px;
+    padding:6px 10px; font: inherit; cursor:pointer;
+  }
+  .toolbar button:hover { background:#30363d; }
+  .logbox {
+    background:#0b0f14; border:1px solid #21262d; border-radius:6px;
+    max-height:420px; overflow:auto; padding:8px;
+  }
+  .row { display:grid; grid-template-columns: 84px 170px 1fr; gap:10px; padding:3px 4px; border-radius:4px; font-size:13px; }
+  .row:hover { background:#161b22; }
+  .t { color:#8b949e; }
+  .k { color:#79c0ff; }
+  .d { color:#a5d6ff; word-break:break-all; }
+  .row.open_mic .k { color:#3fb950; font-weight:600; }
+  .row.ws_open .k, .row.ws_close .k { color:#6e7681; }
+  .row.extension_connected .k, .row.wrapper_connected .k { color:#d2a8ff; }
+  .row.extension_disconnected .k, .row.wrapper_disconnected .k { color:#ffa657; }
+  .row.ws_error .k { color:#f85149; }
 </style>
 </head>
 <body>
@@ -148,6 +159,7 @@ const INDEX_HTML = `<!doctype html>
       <div class="muted" id="extDevice" style="margin-top:6px">device: —</div>
       <div class="muted" id="extLast" style="margin-top:2px">last audio: —</div>
       <div class="muted" id="extCount" style="margin-top:2px">chunks: 0</div>
+      <div class="muted" id="extSpeech" style="margin-top:2px">speech: 0</div>
     </div>
 
     <div class="card">
@@ -158,11 +170,22 @@ const INDEX_HTML = `<!doctype html>
   </div>
 
   <div class="card">
-    <h2>Events (last 40)</h2>
-    <table>
-      <thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead>
-      <tbody id="events"><tr><td colspan="3" class="muted">waiting…</td></tr></tbody>
-    </table>
+    <div class="toolbar">
+      <strong>Logs</strong>
+      <select id="filter">
+        <option value="">all events</option>
+        <option value="open_mic">open_mic only</option>
+        <option value="extension_connected">extension connect</option>
+        <option value="wrapper_connected">wrapper connect</option>
+        <option value="ws_error">errors only</option>
+      </select>
+      <label class="muted"><input type="checkbox" id="autoscroll" checked> auto-scroll</label>
+      <button id="clear">Clear log</button>
+      <span class="muted" id="countLabel"></span>
+    </div>
+    <div class="logbox" id="logbox">
+      <div class="muted">waiting for events…</div>
+    </div>
   </div>
 
 <script>
@@ -172,6 +195,12 @@ function fmtAgo(ts){ if(!ts) return '—'; const s=Math.floor((Date.now()-ts)/10
   return Math.floor(m/60)+'h ago'; }
 function fmtUptime(ms){ const s=Math.floor(ms/1000); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
   return h+'h '+m+'m '+(s%60)+'s'; }
+
+document.getElementById('clear').onclick = async () => {
+  await fetch('/clear', { method: 'POST' });
+};
+
+let lastEventCount = 0;
 
 async function tick(){
   try {
@@ -185,6 +214,7 @@ async function tick(){
     document.getElementById('extDevice').textContent = 'device: ' + (e.deviceLabel || '—');
     document.getElementById('extLast').textContent = 'last audio: ' + fmtAgo(e.lastAudioAt);
     document.getElementById('extCount').textContent = 'chunks: ' + e.audioCount;
+    document.getElementById('extSpeech').textContent = 'speech: ' + e.speechCount;
 
     document.getElementById('wrapDot').className = 'dot' + (s.wrapperCount>0?' on':'');
     document.getElementById('wrapCount').textContent = s.wrapperCount;
@@ -192,17 +222,33 @@ async function tick(){
       ? s.wrappers.map(w => w.ip + ' <span class="muted">(' + fmtAgo(w.since) + ')</span>').join('<br>')
       : '—';
 
-    const rows = s.events.map(ev =>
-      '<tr class="evt"><td class="t">'+fmtTs(ev.ts)+'</td><td class="k">'+ev.type+'</td>'+
-      '<td class="d">'+ (ev.detail ? JSON.stringify(ev.detail) : '') +'</td></tr>'
-    ).join('');
-    document.getElementById('events').innerHTML = rows || '<tr><td colspan="3" class="muted">no events</td></tr>';
+    const filter = document.getElementById('filter').value;
+    let rows = s.events;
+    if (filter) rows = rows.filter(ev => ev.type === filter);
+    const total = rows.length;
+    rows = rows.slice(0, 200);
+
+    document.getElementById('countLabel').textContent = total + ' event' + (total===1?'':'s');
+    document.getElementById('logbox').innerHTML = rows.length
+      ? rows.map(ev =>
+          '<div class="row ' + ev.type + '">' +
+          '<span class="t">' + fmtTs(ev.ts) + '</span>' +
+          '<span class="k">' + ev.type + '</span>' +
+          '<span class="d">' + (ev.detail ? JSON.stringify(ev.detail) : '') + '</span>' +
+          '</div>').join('')
+      : '<div class="muted">no events</div>';
+
+    if (document.getElementById('autoscroll').checked && s.events.length !== lastEventCount) {
+      document.getElementById('logbox').scrollTop = 0;
+    }
+    lastEventCount = s.events.length;
+
   } catch (err) {
     document.getElementById('uptime').textContent = 'connection to server failed';
   }
 }
 tick();
-setInterval(tick, 2000);
+setInterval(tick, 1500);
 </script>
 </body>
 </html>`;
